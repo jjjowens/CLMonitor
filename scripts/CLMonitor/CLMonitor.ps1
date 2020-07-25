@@ -1,10 +1,10 @@
 ﻿# ------------------------------------------------------------------------------------------------------------------
-# Script      : CLTimeLimit.ps1
+# Script      : CLMonitor.ps1
 # Author      : James Owens                                      
 # Date        : 10-July-2020                                     
 # Version     : V 0.1beta                                            
 # Run         : Windows Task Scheduler, on Logon event using command 
-#             : PowerShell -noprofile -executionpolicy bypass -file "CLTimeLimit.ps1" user_id
+#             : PowerShell -noprofile -executionpolicy bypass -file "x:\path\to\script\CLMonitor.ps1" "user_id"
 # ------------------------------------------------------------------------------------------------------------------
 # Description: PowerShell script created to control how much time a given Windows user can keep
 #   a session open. There are three parameters to control this:
@@ -35,17 +35,16 @@
 # ------------------------------------------------------------------------------------------------------------------
 
 #Define runtime environment
-$Error.Clear()
-#Set-StrictMode –Version Latest      
+$Error.Clear()   
 
 # ------------------------------------------------------------------------------------------------------------------
 # USER DEFINED PARAMETERS
 # ------------------------------------------------------------------------------------------------------------------
 
-$maxActive                                = 120                  # Max time allowed in minutes, default 60 minutes
-$minBreak                                 = 60                   # Minimum break in minutes, default 10 minutes
-$dayMin                                   = Get-Date '09:00'     # Time of day computer can be used. Before this time it will not allow login, default 09:00
-$dayMax                                   = Get-Date '22:11'     # Time of day computer will shutdown. Past this time it will not allow login, default 22:00
+$maxActive                                = 16                   # Max time allowed in minutes, default 60 minutes
+$minBreak                                 = 4                    # Minimum break in minutes, default 10 minutes
+$dayMin                                   = Get-Date '10:00'     # Time of day computer can be used. Before this time it will not allow login, default 09:00
+$dayMax                                   = Get-Date '22:00'     # Time of day computer will shutdown. Past this time it will not allow login, default 22:00
 
 # ------------------------------------------------------------------------------------------------------------------
 # INTERNAL SETTINGS
@@ -53,19 +52,127 @@ $dayMax                                   = Get-Date '22:11'     # Time of day c
 
 $debug                                    = "ON"                 # Turn "ON" / "OFF"  debug, default: "OFF" 
 $loopDelay                                = 30                   #in seconds
-$configFolder                             = "$ENV:TEMP\49XfjUZaRl1"
-$configFile                               = "$($configFolder)\8EorCi7NH4JEuj0.CLTL"
-$log                                      = "$($configFolder)\CLTimeLimit.log" 
 $dateFormatLog                            = "yyyy-MM-dd HH:mm:ss.fff"
 $dateFormatConfig                         = "yyyy-MM-dd HH:mm:ss"
 $user                                     = $args[0]
-#$user                                     = "jjowens"
+#$user                                    = "jjowens"
+$fullUser                                 = "$($ENV:COMPUTERNAME)\$($user)"
+
+$configFolder                             = "$ENV:TEMP\49XfjUZaRl1"
+$configFile                               = "$($configFolder)\8EorCi7NH4JEuj0.$($user)"
+
+$msgAppData                               = "AppData"
+$msgLocal                                 = "Local"
+$msgComLimites                            = "ComLimites"
+$msgFolder                                = "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)"
+$msgFile                                  = "$($msgFolder)\CLClientMsg_$($user).msg"
+
+$log                                      = "$($configFolder)\CLTimeLimit_$($user).log" 
+$id                                       = get-random
+
 
 # ------------------------------------------------------------------------------------------------------------------
-# FUNCTIONS
+# C# Supporting functions
 # ------------------------------------------------------------------------------------------------------------------
 
 
+$code = @"
+
+/**
+ * Provides a mean to obtain the session ID of a given user on the local computer,
+ * as well as a mean to logoff an user.
+ * This is necessary in particular on Home versions of Windows as they do not include
+ * tools for handling a multi-user environment, such as built in command 'quser' and 
+ * 'logoff'
+**/
+    using System;
+    using System.Collections.Generic;
+    using System.Runtime.InteropServices;
+
+    namespace ConsoleApplication
+    {
+
+        public class Program$id
+        {
+            [DllImport("wtsapi32.dll", SetLastError = true)]
+            static extern bool WTSLogoffSession(IntPtr hServer, int SessionId, bool bWait);
+ 
+            [DllImport("wtsapi32.dll", SetLastError = true)]
+            static extern IntPtr WTSOpenServer([MarshalAs(UnmanagedType.LPStr)] String pServerName);
+
+            [DllImport("wtsapi32.dll")]
+            static extern void WTSCloseServer(IntPtr hServer);
+
+            
+            [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)] 
+            static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+            
+            [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+            static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
+
+
+            // Logs of the user based on the machine and the user session ID
+            internal static bool LogOffUser(IntPtr server, int userSessionID)
+            {
+                return WTSLogoffSession(server, userSessionID, true);
+            }
+
+
+            public static void Main(string[] args)
+            {
+            
+                int userSessionID = int.Parse (args[0]);
+                IntPtr server = WTSOpenServer(Environment.MachineName);
+                try
+                {
+                    LogOffUser(server, userSessionID);
+                }
+                finally
+                {
+                    WTSCloseServer(server);
+                }
+            }
+        }
+    }
+"@
+
+# Compile the C# code
+Add-Type -TypeDefinition $code -Language CSharp
+
+
+
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# POWERSHELL FUNCTIONS
+# ------------------------------------------------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------
+# Logoff user based on given session ID.
+# Uses embedded C# code for this purpose as Windows Home
+# edition does not include command 'logoff'
+# ---------------------------------------------------------
+Function User-Logoff ([int] $sessionID)
+{
+    Invoke-Expression "[ConsoleApplication.Program$id]::Main(`"$($sessionID)`")"
+}
+
+
+# ---------------------------------------------------------
+# Get PID associated to Explorer process for the user. 
+# The presence of this process is an indicator that user is 
+# logged in or not. 
+# ---------------------------------------------------------
+Function Get-Session-Id ([string] $userID)
+{
+    $explorerPID = Get-Process -Name explorer -IncludeUserName | Where-Object {$_.UserName -eq $fullUser } | Select -ExpandProperty 'Id'
+    if ( $explorerPID ) 
+    { 
+        return (Get-Process -PID $explorerPID).SessionID 
+    }
+}
 
 
 # ---------------------------------------------------------
@@ -94,32 +201,42 @@ Function Reset-Config-File
     Update-Config-File "0" "false"
 }
 
-# ---------------------------------------------------------
-# Plays an audio WAV file given as parameter. It will not
-# play anything if file is not found.
-# ---------------------------------------------------------
-Function Play-Audio-Message ([string] $soundFile)
-{
-    if ( Test-Path -Path "$($PSScriptRoot)\$soundFile" )
-    {
-        if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Playing audio file $($soundFile)" >> $log }
-        $PlayWav=New-Object System.Media.SoundPlayer
-        $PlayWav.SoundLocation = "$($PSScriptRoot)\$soundFile"
-        $PlayWav.playsync()
-    }
-    else {
-        if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Audio file `'$($soundFile)`' not found." >> $log }
-    }
-}
 
 # ---------------------------------------------------------
-# Displays an asychronous message to user
+# Create an empty message file for user/client process
 # ---------------------------------------------------------
-Function Display-Message ([string] $msg)
+Function Send-Message-Client ($thisMsg, $audioFile)
 {
-    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) MESSAGE: [`n$($msg)`n]" >> $log }
-    msg $user $msg
+    echo "Message: $($thisMsg)"
+    echo "AudioFile: $($audioFile)"
+
+    $content = "$($audioFile)`n$($thisMsg)"
+    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Writing message in $($msgFile)" >> $log }
+    New-Item -Path $msgFile -ItemType File -Value "$($content)" -Force
+
+    $i = 0
+    do {
+        $i++
+        Start-Sleep -s 1
+        $fileContent = Get-Content $msgFile
+        if ( $fileContent -eq $null) 
+        {
+            if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Message file is empty: $($msgFile)" >> $log }
+        }
+    } while ( (-not($fileContent -eq $null)) -and ($i -lt 60) )
+ 
 }
+
+
+# ---------------------------------------------------------
+# Create an empty message file for user/client process
+# ---------------------------------------------------------
+Function Create-Message-File
+{
+    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Creating message file $($msgFile)" >> $log }
+    New-Item -Path $msgFile -ItemType File -Value "" -Force
+}
+
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -136,12 +253,16 @@ if ( $debug -eq "ON" ) { echo "--------------" >> $log }
 # If user is not defined, abort.
 if ( -not($user) ) 
 {
-    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  Username was NOT passed in the arguments. Exitig script." >> $log }
+    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  Username was NOT passed in the arguments. Exitig script." }
     exit
 }
 
+# Reset message file, to ensure it has no messages to start with.
+Create-Message-File
+
 $now = Get-Date
-$sessionId = ((quser | Where-Object { $_ -match $user }) -split ' +')[2]                #User SessionID is used to determined if user is logged in or not.
+$sessionId = Get-Session-Id ($fullUser)
+echo "SessionID: $($sessionId)"
 
 if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) User: `'$($user)`' Break: `'$($minBreak)`' minutes, max session duration is $($maxActive) minutes and allowed times between `'$($dayMin)`' and `'$($dayMax)`'" >> $log }
 
@@ -155,6 +276,35 @@ if ( -not (Test-Path -Path $configFolder -PathType Container) )
         if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Unable to create folder $($configFolder). Exiting script." >> $log }
         Exit
     }
+}
+
+
+# Ensure path where message file will be saved is valid. Will create folder if one does not exist.
+if ( -not (Test-Path -Path "$ENV:PUBLIC\$($msgAppData)" -PathType Container) )
+{
+    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  Folder $ENV:PUBLIC\$($msgAppData) not found, creating it $ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)" >> $log }
+    mkdir "$ENV:PUBLIC\$($msgAppData)"
+    mkdir "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)"
+    mkdir "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)"
+}
+else {
+    if ( -not (Test-Path -Path "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)" -PathType Container) )
+    {
+        if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  Folder $ENV:PUBLIC\$($msgAppData)\$($msgLocal) not found, creating it $ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)" >> $log }
+        mkdir "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)"
+        mkdir "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)"
+    }
+    else {
+        if ( -not (Test-Path -Path "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)" -PathType Container) )
+        {
+            if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  Folder $ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites) not found, creating it $ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)" >> $log }
+            mkdir "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)"
+        }
+    }
+}
+if ( -not (Test-Path -Path "$ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites)" -PathType Container) )
+{
+    if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog)  There was a problem creating folders $ENV:PUBLIC\$($msgAppData)\$($msgLocal)\$($msgComLimites). Messages will not be sent to user." >> $log }
 }
 
 
@@ -180,6 +330,7 @@ if ( Test-Path -Path $configFolder -PathType Container )
         if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Temp file $($configFile) is from an earlier day. Reinitializing parameters." >> $log }
         Reset-Config-File
     }
+
 
 
     # Read configuration file contents
@@ -212,11 +363,11 @@ if ( Test-Path -Path $configFolder -PathType Container )
             $breakFlag = "false"
         }
         else {
-            Display-Message "Back already? Go play some more. You are on break for another $(($dateInFile.AddMinutes($minBreak + 1) - $now).Minutes) minute(s)."
-            Play-Audio-Message "stillinbreak.wav"
+            Send-Message-Client ("Back already? Go play some more. You are on break for another $(($dateInFile.AddMinutes($minBreak + 1) - $now).Minutes) minute(s).", "stillinbreak.wav")
             Start-Sleep -s 10
             if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Logging off user $($user)." >> $log }
-            logoff $sessionId
+            #logoff $sessionId
+            User-Logoff ($sessionId)
             if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Ending script." >> $log }
             exit
         }
@@ -269,8 +420,7 @@ if ( Test-Path -Path $configFolder -PathType Container )
         {
             $timeSecondsRound = $timeLeftSeconds / 60
             $timeSecondsRound = [math]::Round($timeSecondsRound, 1)
-            Display-Message "Welcome back! This is a continuation of your previous session`nYou have $($timeSecondsRound) minutes left."
-            Play-Audio-Message "continuesession.wav"
+            Send-Message-Client "Welcome back! This is a continuation of your previous session`nYou have $($timeSecondsRound) minutes left." "continuesession.wav"
             if ($timeSecondsRound -lt 15 ) { $warning15 = "true" }
             if ($timeSecondsRound -lt 5  ) { $warning5  = "true" } 
         }
@@ -314,16 +464,14 @@ if ( Test-Path -Path $configFolder -PathType Container )
                     if ( (($timeLeftSeconds/60) -lt 15 ) -and ($warning15 -eq "false") -and ($warning5 -eq "false") )
                     {
                         $warning15 = "true"
-                        Display-Message "Just a reminder that your break will start in 15 minutes."
-                        Play-Audio-Message "15minwarning.wav"
+                        Send-Message-Client "Just a reminder that your break will start in 15 minutes." "15minwarning.wav"
                     }
 
                     # Do it again, but this time at the 5 minute mark
                     if ( (($timeLeftSeconds/60) -lt 5) -and ($warning15 -eq "true") -and ($warning5 -eq "false") )
                     {
                         $warning5 = "true"
-                        Display-Message "Just a reminder that your break will start in 5 minutes."
-                        Play-Audio-Message "5minwarning.wav"
+                        Send-Message-Client "Just a reminder that your break will start in 5 minutes." "5minwarning.wav" 
                     }
 
                 }
@@ -333,20 +481,18 @@ if ( Test-Path -Path $configFolder -PathType Container )
 
                     #Update config file setting break flag to true
                     Update-Config-File "0" "true"
-                    Display-Message "You have used the computer for $($maxActive) minutes. It's time to take a $($minBreak) minute break. `n`nSave your work!!`n`nYour session will close in 60 seconds."
-                    Play-Audio-Message "timesup.wav"
+                    Send-Message-Client "You have used the computer for $($maxActive) minutes. It's time to take a $($minBreak) minute break. `n`nSave your work!!`n`nYour session will close in 60 seconds." "timesup.wav"
                     Start-Sleep -s 60
                     if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Logging off user $($user)." >> $log }
-                    $sessionId = ((quser | Where-Object { $_ -match $user }) -split ' +')[2]
-                    logoff $sessionId
+                    User-Logoff ($sessionId)
+                    $sessionId = Get-Session-Id ($fullUser)
+                    User-Logoff ($sessionId)
                     if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Exiting script." >> $log }
                     Update-Config-File "0" "true" # Repeat update here in case user decides to wait the entre 60 seconds. 
                     exit
                 }
 
-                #Check if user logged out and if so, set to 'On Break' and kill script
-                $sessionId = ((quser | Where-Object { $_ -match $user }) -split ' +')[2]
-
+                $sessionId = Get-Session-Id ($fullUser)
                 if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Checked user status and got `'$($sessionId)`'" >> $log }
 
                 # True if user is no longer in
@@ -367,12 +513,12 @@ if ( Test-Path -Path $configFolder -PathType Container )
                 $msg = "It is now $($now.TimeOfDay.Hours):$($now.TimeOfDay.Minutes):$($now.TimeOfDay.Seconds). "
                 $msg = "$($msg)This account is set to be enabled between `n`n$($dayMin.TimeOfDay) and `n" 
                 $msg = "$($msg)$($dayMax.TimeOfDay)`n`nYou will be logged out in 10 seconds!"
-                Display-Message $msg
-                Play-Audio-Message "outsidehours.wav"
+                Send-Message-Client $msg "outsidehours.wav"
                 Start-Sleep -s 10
                 if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Logging off user $($user)." >> $log }
-                $sessionId = ((quser | Where-Object { $_ -match $user }) -split ' +')[2]
-                logoff $sessionId
+                User-Logoff ($sessionId)
+                $sessionId = Get-Session-Id ($fullUser)
+                
                 if ( $debug -eq "ON" ) { echo "$(Get-Date -Format $dateFormatLog) Exiting script." >> $log }
                 exit
             }
